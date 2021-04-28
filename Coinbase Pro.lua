@@ -26,7 +26,7 @@
 -- SOFTWARE.
 
 WebBanking {
-        version = 1.1,
+        version = 2.0,
         url = "https://api.pro.coinbase.com",
         description = "Fetch balances via Coinbase Pro API and list them as securities",
         services = { "Coinbase Pro" }
@@ -64,33 +64,100 @@ function RefreshAccount (account, since)
         local s = {}
         local balances = queryCoinbaseProApi("accounts")
         local products = queryCoinbaseProApi("products")
-        for key, value in pairs(balances) do
-                local balanceCurrency = value["currency"]
-                local securityCurrency = nil
-                local price = nil
+        local orders = {}
+
+        -- Fetch pages of 100 orders, iterate through them page by page until cb-after header is unset
+        after = "start"
+        while after ~= nil do
+                if after == "start" then
+                        orders_data, headers = queryCoinbaseProApi("orders?&status=done")
+                else
+                        orders_data, headers = queryCoinbaseProApi("orders?after=" .. after .. "&status=done")
+                end
+                -- Set our next page to cb-after header
+                after = headers["cb-after"]
+                -- Merge new results
+                orders = merge(orders, orders_data)
+        end
+
+        -- Match orders to our balances
+        for _, balance_data in pairs(balances) do
+                local after = nil
+                local crypto_shorthandle = balance_data["currency"]
+                local total_quantity = tonumber(balance_data["balance"])
+                local price = 1
+                local product_id = crypto_shorthandle .. "-" .. nativeCurrency
                 local amount = nil
+                local bought_quantity = 0
+                local transferred_quantity = 0
                 local quantity = nil
-                if balanceCurrency == nativeCurrency then
+                local currency = nil
+                local order_value = 0.0
+                local timestamp = nil
+                local latest_timestamp = 0
+                local pattern = "(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+).%d+Z"
+
+                if crypto_shorthandle ~= nativeCurrency and productsExists(product_id, products) then
+                        price = queryExchangeRate(product_id, products)
+                        -- Iterate through our orders in reverse, oldest transactions first
+                        for i = #orders, 1, -1 do        
+                                -- Bought coins
+                                if orders[i]["side"] == "buy" and orders[i]["product_id"] == product_id then
+                                        bought_quantity = bought_quantity + orders[i]["filled_size"]
+                                        -- We have to generate a proper timestamp for MoneyMoney
+                                        year, month, day, hour, min, sec = orders[i]["done_at"]:match(pattern)
+                                        timestamp = os.time({day=day,month=month,year=year,hour=hour,min=min,sec=sec})
+                                        if timestamp > latest_timestamp then
+                                                latest_timestamp = timestamp
+                                        end
+                                        -- This trades coin value at trade time
+                                        if orders[i]["price"] ~= nil then
+                                                order_value = order_value + (orders[i]["price"] * orders[i]["filled_size"])
+                                        else
+                                                order_value = order_value + (1 / orders[i]["filled_size"] * orders[i]["executed_value"] * orders[i]["filled_size"])
+                                        end
+                                end
+                                -- Sold coins
+                                if orders[i]["side"] == "sell" and orders[i]["product_id"] == product_id then
+                                        bought_quantity = bought_quantity - orders[i]["filled_size"]
+                                        -- We have to generate a proper timestamp for MoneyMoney
+                                        year, month, day, hour, min, sec = orders[i]["done_at"]:match(pattern)
+                                        timestamp = os.time({day=day,month=month,year=year,hour=hour,min=min,sec=sec})
+                                        if timestamp > latest_timestamp then
+                                                latest_timestamp = timestamp
+                                        end
+                                        -- Value of coins is average value of all coins at sell time
+                                        order_value = order_value - (order_value * orders[i]["filled_size"])
+                                end
+                        end
+                        -- Add unknown quantities of coins as current purchase price
+                        transferred_quantity = total_quantity - bought_quantity
+                        order_value = order_value + (price * transferred_quantity)
+
+                        -- Weighted average order price of all orders
+                        if total_quantity > 0 then
+                                order_value = order_value / total_quantity
+                        else
+                                order_value = 0
+                        end
+
+                        -- Securities
                         s[#s+1] = {
-                                name = value["currency"],
+                                tradeTimestamp = timestamp,
+                                name = crypto_shorthandle,
                                 market = market,
-                                currency = balanceCurrency,
-                                quantity = quantity,
+                                quantity = total_quantity,
+                                currency = currency,
                                 price = price,
-                                amount = value["balance"]
+                                purchasePrice = order_value,
+                                amount = total_quantity * price
                         }
                 else
-                        local product_id = balanceCurrency .. '-' .. nativeCurrency
-                        if productsExists(product_id, products) then
-                                s[#s+1] = {
-                                        name = value["currency"],
-                                        market = market,
-                                        currency = securityCurrency,
-                                        quantity = value["balance"],
-                                        price = queryExchangeRate(product_id),
-                                        amount = amount
-                                }
-                        end
+                        -- A native currency, not a crypto coin
+                        quantity = nil
+                        price = nil
+                        currency = nativeCurrency
+                        amount = total_quantity
                 end
         end
         return {securities = s}
@@ -116,6 +183,8 @@ function base64decode(data)
 end
 
 function queryCoinbaseProApi(endpoint)
+        -- if we run into too many requests we need to uncomment this
+        -- sleep(1)
         local path = string.format("/%s", endpoint)
         local timestamp = string.format("%d", MM.time())
         local apiSign = MM.hmac256(base64decode(apiSecret), timestamp .. "GET" .. path)
@@ -126,12 +195,18 @@ function queryCoinbaseProApi(endpoint)
         headers["CB-ACCESS-SIGN"] = MM.base64(apiSign)
         headers["CB-ACCESS-PASSPHRASE"] = apiPassphrase
 
-        local content = Connection():request("GET", url .. path, nil, nil, headers)
-        return JSON(content):dictionary()
+        content, charset, mimeType, filename, rem_headers = Connection():request("GET", url .. path, nil, nil, headers)
+        return JSON(content):dictionary(), rem_headers
 end
 
-function queryExchangeRate(product_id)
-        return queryCoinbaseProApi("products/" .. product_id .. "/ticker")["price"]
+function queryExchangeRate(product_id, products)
+        ticker = queryCoinbaseProApi("products/" .. product_id .. "/ticker")
+        -- sometimes newly added coins have no prices in ticket yet, then we have to use something else
+        if ticker["price"] then
+                return ticker["price"]
+        else
+                return ticker["bid"]
+        end
 end
 
 function productsExists(product_id, products)
@@ -141,4 +216,18 @@ function productsExists(product_id, products)
         return false
 end
 
--- SIGNATURE: MC0CFEG8subcDGgx/zTD7J/1tZqFZzwHAhUAml+4P1Ykr5zy+8ZerTz6I4AKsqQ=
+-- Sleep function
+local clock = os.clock
+function sleep(n)  -- seconds
+  local t0 = clock()
+  while clock() - t0 <= n do end
+end
+
+-- Merge two tables: https://stackoverflow.com/a/29133654
+function merge(a, b)
+        if type(a) == 'table' and type(b) == 'table' then
+                for k,v in pairs(b) do if type(v)=='table' and type(a[k] or false)=='table' then merge(a[k],v) else a[k]=v end end
+        end
+        return a
+end
+-- SIGNATURE: MCwCFFrI1B5aenRMx/jAkWnJLKRDWkq3AhQusomTlSPK5Kv7yq7HFc9PCyIXjg==
